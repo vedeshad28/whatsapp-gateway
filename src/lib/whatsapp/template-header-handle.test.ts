@@ -78,4 +78,27 @@ describe('ensureImageHeaderHandle', () => {
     vi.stubGlobal('fetch', vi.fn(async () => imgResponse('image/png', 6 * 1024 * 1024)));
     await expect(ensureImageHeaderHandle(payload(), 'tok')).rejects.toThrow(/5 MB/);
   });
+
+  it('derives + sets header_handle from a valid document URL', async () => {
+    vi.stubEnv('META_APP_ID', 'app-1');
+    vi.stubGlobal('fetch', vi.fn(async () => imgResponse('application/pdf', 2048)));
+    const p = payload({ header_type: 'document', header_media_url: 'https://x.test/invoice.pdf' });
+    await ensureImageHeaderHandle(p, 'tok');
+    expect(uploadResumableMedia).toHaveBeenCalledOnce();
+    expect(p.header_handle).toBe('HANDLE123');
+  });
+
+  it('rejects a non-PDF content type for a document header', async () => {
+    vi.stubEnv('META_APP_ID', 'app-1');
+    vi.stubGlobal('fetch', vi.fn(async () => imgResponse('image/jpeg')));
+    const p = payload({ header_type: 'document', header_media_url: 'https://x.test/invoice.pdf' });
+    await expect(ensureImageHeaderHandle(p, 'tok')).rejects.toThrow(/PDF/);
+  });
+
+  it('rejects a document over 100 MB', async () => {
+    vi.stubEnv('META_APP_ID', 'app-1');
+    vi.stubGlobal('fetch', vi.fn(async () => imgResponse('application/pdf', 101 * 1024 * 1024)));
+    const p = payload({ header_type: 'document', header_media_url: 'https://x.test/invoice.pdf' });
+    await expect(ensureImageHeaderHandle(p, 'tok')).rejects.toThrow(/100 MB/);
+  });
 });

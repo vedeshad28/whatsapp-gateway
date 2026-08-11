@@ -14,6 +14,8 @@ const eslintConfig = defineConfig([
     "next-env.d.ts",
     // Vendored minified opus-recorder encoder worker (served statically).
     "public/opus/**",
+    // Plain Node CLI scripts (CommonJS, run outside the Next.js app).
+    "scripts/**",
   ]),
 ]);
 

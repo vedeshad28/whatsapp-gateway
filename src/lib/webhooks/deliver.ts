@@ -4,30 +4,31 @@
 // `dispatchWebhookEvent` finds the account's active endpoints
 // subscribed to an event, signs one JSON payload, and POSTs it to
 // each in parallel. It is best-effort and never throws — callers fire
-// it from the inbound webhook's `after()` block, where a failed
-// delivery must not affect the 200 OK returned to Meta.
+// it from the inbound webhook handler, where a failed delivery must
+// not affect the 200 OK returned to Meta.
 //
-// Delivery semantics (documented in docs/public-api.md):
+// Delivery semantics:
 //   - At-most-once per event, single attempt with a short timeout.
-//   - Each consecutive failure bumps `failure_count`; once it crosses
+//   - Each consecutive failure bumps `failureCount`; once it crosses
 //     MAX_CONSECUTIVE_FAILURES the endpoint is auto-disabled
-//     (`is_active = false`) so a dead sink stops being hit. A success
-//     resets the counter and stamps `last_delivery_at`.
+//     (`isActive = false`) so a dead sink stops being hit. A success
+//     resets the counter and stamps `lastDeliveryAt`.
 //   - Durable retry-with-backoff would need a queue/worker (a
-//     follow-up); in-process retries inside `after()` would burn the
-//     route's duration budget without a real durability guarantee.
+//     follow-up); in-process retries here would burn the request's
+//     duration budget without a real durability guarantee.
+//
+// Ported from wacrm onto Prisma; logic unchanged.
 // ============================================================
 
 import { randomUUID } from 'node:crypto';
 
-import type { SupabaseClient } from '@supabase/supabase-js';
-
+import { prisma } from '@/lib/db';
 import { decrypt } from '@/lib/whatsapp/encryption';
 import { buildSignatureHeader } from '@/lib/webhooks/sign';
 import { isDeliverableUrl } from '@/lib/webhooks/ssrf';
 import type { WebhookEvent } from '@/lib/webhooks/events';
 
-/** Per-endpoint HTTP timeout. Kept short — this runs in `after()`. */
+/** Per-endpoint HTTP timeout. Kept short — this runs inline in a request. */
 export const DELIVERY_TIMEOUT_MS = 5000;
 
 /** Auto-disable an endpoint after this many consecutive failures. */
@@ -44,20 +45,17 @@ interface EndpointRow {
  * subscribed to it. Never throws.
  */
 export async function dispatchWebhookEvent(
-  db: SupabaseClient,
   accountId: string,
   event: WebhookEvent,
   data: unknown
 ): Promise<void> {
   try {
-    const { data: rows, error } = await db
-      .from('webhook_endpoints')
-      .select('id, url, secret')
-      .eq('account_id', accountId)
-      .eq('is_active', true)
-      .contains('events', [event]);
+    const rows = await prisma.webhookEndpoint.findMany({
+      where: { accountId, isActive: true, events: { has: event } },
+      select: { id: true, url: true, secret: true },
+    });
 
-    if (error || !rows || rows.length === 0) return;
+    if (rows.length === 0) return;
 
     // Sign the exact bytes we send so a receiver can recompute the
     // HMAC over the raw request body. `id` is a per-delivery uuid the
@@ -73,18 +71,14 @@ export async function dispatchWebhookEvent(
     const tsSeconds = Math.floor(Date.now() / 1000);
 
     await Promise.allSettled(
-      (rows as EndpointRow[]).map((row) =>
-        deliverOne(db, row, event, payload, tsSeconds)
-      )
+      rows.map((row) => deliverOne(row as EndpointRow, event, payload, tsSeconds))
     );
   } catch (err) {
-    // Never let a delivery problem bubble into the webhook response.
     console.error('[webhooks] dispatch failed:', err);
   }
 }
 
 async function deliverOne(
-  db: SupabaseClient,
   row: EndpointRow,
   event: WebhookEvent,
   payload: string,
@@ -95,7 +89,7 @@ async function deliverOne(
   // misconfigured internal URL surfaces and eventually auto-disables.
   if (!(await isDeliverableUrl(row.url))) {
     console.warn('[webhooks] refusing non-public delivery target for', row.id);
-    await recordFailure(db, row);
+    await recordFailure(row.id);
     return;
   }
 
@@ -103,10 +97,8 @@ async function deliverOne(
   try {
     secret = decrypt(row.secret);
   } catch (err) {
-    // A row whose secret can't be decrypted can never produce a valid
-    // signature — count it as a failure so it eventually auto-disables.
     console.error('[webhooks] secret decrypt failed for', row.id, err);
-    await recordFailure(db, row);
+    await recordFailure(row.id);
     return;
   }
 
@@ -115,44 +107,50 @@ async function deliverOne(
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'X-Wacrm-Event': event,
-        'X-Wacrm-Webhook-Id': row.id,
-        'X-Wacrm-Signature': buildSignatureHeader(payload, secret, tsSeconds),
+        'X-Gateway-Event': event,
+        'X-Gateway-Webhook-Id': row.id,
+        'X-Gateway-Signature': buildSignatureHeader(payload, secret, tsSeconds),
       },
       body: payload,
       // Do NOT follow redirects — a public URL could 3xx-bounce to an
-      // internal address, bypassing the SSRF check above. A 3xx is a
-      // misconfiguration; treat it as a failure.
+      // internal address, bypassing the SSRF check above.
       redirect: 'manual',
       signal: AbortSignal.timeout(DELIVERY_TIMEOUT_MS),
     });
     if (!res.ok) throw new Error(`endpoint responded ${res.status}`);
 
-    // Success: clear the failure streak.
-    await db
-      .from('webhook_endpoints')
-      .update({ failure_count: 0, last_delivery_at: new Date().toISOString() })
-      .eq('id', row.id);
+    await prisma.webhookEndpoint.update({
+      where: { id: row.id },
+      data: { failureCount: 0, lastDeliveryAt: new Date() },
+    });
   } catch (err) {
     console.warn(
       `[webhooks] delivery to ${row.id} failed:`,
       err instanceof Error ? err.message : err
     );
-    await recordFailure(db, row);
+    await recordFailure(row.id);
   }
 }
 
-async function recordFailure(db: SupabaseClient, row: EndpointRow): Promise<void> {
-  // Atomic increment (+ auto-disable at the threshold) via a SQL
-  // function — a read-modify-write here would lose increments when two
-  // deliveries to the same endpoint run concurrently (e.g.
-  // conversation.created + message.received for one inbound message),
-  // so a dead endpoint might never reach the disable threshold.
-  const { error } = await db.rpc('record_webhook_failure', {
-    endpoint_id: row.id,
-    max_failures: MAX_CONSECUTIVE_FAILURES,
-  });
-  if (error) {
-    console.error('[webhooks] record_webhook_failure failed for', row.id, error);
+/**
+ * Atomic increment (+ auto-disable at the threshold). A read-modify-
+ * write here would lose increments when two deliveries to the same
+ * endpoint run concurrently, so a dead endpoint might never reach the
+ * disable threshold — a raw SQL update keeps the `+1` and the disable
+ * decision in one statement.
+ */
+async function recordFailure(endpointId: string): Promise<void> {
+  try {
+    await prisma.$executeRaw`
+      UPDATE webhook_endpoints
+      SET failure_count = failure_count + 1,
+          is_active = CASE
+            WHEN failure_count + 1 >= ${MAX_CONSECUTIVE_FAILURES} THEN false
+            ELSE is_active
+          END
+      WHERE id = ${endpointId}::uuid
+    `;
+  } catch (err) {
+    console.error('[webhooks] record_webhook_failure failed for', endpointId, err);
   }
 }

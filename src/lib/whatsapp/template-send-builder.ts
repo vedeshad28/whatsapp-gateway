@@ -42,6 +42,8 @@ export interface SendTimeParams {
   headerMediaUrl?: string;
   /** Alternative: send the media by Meta media id (from prior upload). */
   headerMediaId?: string;
+  /** Filename shown to the recipient for document headers. */
+  headerFilename?: string;
   /**
    * Per-button overrides keyed by the button's index in the
    * template's `buttons` array. Used for URL buttons with a {{1}}
@@ -110,7 +112,10 @@ function buildHeaderComponent(
       `${headerType} header requires a media link or id at send time — set header_media_url on the template or pass headerMediaUrl/headerMediaId.`,
     );
   }
-  const mediaPayload: { link?: string; id?: string } = id ? { id } : { link };
+  const mediaPayload: { link?: string; id?: string; filename?: string } = id ? { id } : { link };
+  if (headerType === 'document' && params.headerFilename) {
+    mediaPayload.filename = params.headerFilename;
+  }
   return {
     type: 'header',
     parameters: [

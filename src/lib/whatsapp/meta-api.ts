@@ -24,18 +24,96 @@ export interface MetaPhoneInfo {
 }
 
 interface MetaErrorResponse {
-  error?: { message?: string; code?: number; type?: string }
+  error?: {
+    message?: string
+    code?: number
+    type?: string
+    error_subcode?: number
+    error_user_title?: string
+    error_user_msg?: string
+    fbtrace_id?: string
+  }
 }
 
 async function throwMetaError(response: Response, fallback: string): Promise<never> {
   let message = fallback
   try {
     const data = (await response.json()) as MetaErrorResponse
-    if (data.error?.message) message = data.error.message
+    const err = data.error
+    if (err?.message) {
+      const parts = [err.message]
+      if (err.error_user_title) parts.push(err.error_user_title)
+      if (err.error_user_msg) parts.push(err.error_user_msg)
+      if (err.error_subcode) parts.push(`subcode ${err.error_subcode}`)
+      message = parts.join(' — ')
+    }
   } catch {
     // response body wasn't JSON — keep the fallback
   }
   throw new Error(message)
+}
+
+// ============================================================
+// Embedded Signup — authorization code exchange
+// ============================================================
+
+export interface ExchangeCodeForTokenArgs {
+  code: string
+  appId: string
+  appSecret: string
+}
+
+export interface MetaTokenResult {
+  accessToken: string
+  /** Seconds until expiry. Present on the long-lived token; short-lived
+   *  tokens from the initial exchange typically expire in ~1-2 hours. */
+  expiresInSeconds?: number
+}
+
+/**
+ * Exchange the authorization `code` the Embedded Signup popup returns
+ * (via `FB.login`'s callback) for a short-lived Meta access token. No
+ * `redirect_uri` is needed here — that's only required for the
+ * redirect-based OAuth flow, not the JS SDK popup flow Embedded Signup
+ * uses. Requires the app secret, so this only ever runs server-side.
+ */
+export async function exchangeCodeForToken(
+  args: ExchangeCodeForTokenArgs
+): Promise<MetaTokenResult> {
+  const { code, appId, appSecret } = args
+  const url = `${META_API_BASE}/oauth/access_token?client_id=${encodeURIComponent(appId)}&client_secret=${encodeURIComponent(appSecret)}&code=${encodeURIComponent(code)}`
+  const response = await fetch(url)
+  if (!response.ok) {
+    await throwMetaError(response, `Meta API error: ${response.status}`)
+  }
+  const data = (await response.json()) as { access_token: string; expires_in?: number }
+  return { accessToken: data.access_token, expiresInSeconds: data.expires_in }
+}
+
+/**
+ * Exchange a short-lived user token for a long-lived one (~60 days).
+ * Embedded Signup's initial code-exchange token is short-lived; this
+ * is the follow-up call to get something that survives more than a
+ * couple of hours. Best-effort — if it fails, callers can fall back
+ * to the short-lived token rather than failing the whole connect.
+ */
+export interface ExchangeForLongLivedTokenArgs {
+  shortLivedToken: string
+  appId: string
+  appSecret: string
+}
+
+export async function exchangeForLongLivedToken(
+  args: ExchangeForLongLivedTokenArgs
+): Promise<MetaTokenResult> {
+  const { shortLivedToken, appId, appSecret } = args
+  const url = `${META_API_BASE}/oauth/access_token?grant_type=fb_exchange_token&client_id=${encodeURIComponent(appId)}&client_secret=${encodeURIComponent(appSecret)}&fb_exchange_token=${encodeURIComponent(shortLivedToken)}`
+  const response = await fetch(url)
+  if (!response.ok) {
+    await throwMetaError(response, `Meta API error: ${response.status}`)
+  }
+  const data = (await response.json()) as { access_token: string; expires_in?: number }
+  return { accessToken: data.access_token, expiresInSeconds: data.expires_in }
 }
 
 // ============================================================
@@ -402,6 +480,7 @@ export async function sendTemplateMessage(
       headerText: messageParams?.headerText,
       headerMediaUrl: messageParams?.headerMediaUrl,
       headerMediaId: messageParams?.headerMediaId,
+      headerFilename: messageParams?.headerFilename,
       buttonParams: messageParams?.buttonParams,
     })
     if (components.length > 0) {

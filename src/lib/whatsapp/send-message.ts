@@ -1,26 +1,19 @@
 // ============================================================
-// Outbound message send — the core that both the dashboard's
-// `/api/whatsapp/send` route and the public `/api/v1/messages`
-// endpoint call.
+// Outbound message send — the core that both `/api/whatsapp/send`
+// and the public `/api/v1/messages` endpoint call.
 //
 // Given a conversation and message params, this:
 //   1. validates the params for the message type,
 //   2. loads the conversation + contact + WhatsApp config,
 //   3. sends to Meta (with phone-variant retry + contact auto-fix),
-//   4. persists the message + updates the conversation,
-//   5. pauses any active Flow run for the contact (agent stepped in).
+//   4. persists the message + updates the conversation.
 //
-// It is transport-agnostic: it takes a `SupabaseClient` and an
-// `accountId` and throws `SendMessageError` on failure. The callers
-// own auth, rate-limiting, body parsing, and mapping the error to
-// their respective response shapes (internal `{ error }` vs the v1
-// envelope). Behaviour is identical to the original inline route —
-// this is a straight extraction so the public endpoint can reuse it
-// without duplicating ~250 lines of Meta plumbing.
+// Ported from wacrm onto Prisma. Dropped: the Flow-run pause side
+// effect (step 5 in the original) — Flows/automations aren't part of
+// this gateway, there's nothing to pause.
 // ============================================================
 
-import type { SupabaseClient } from '@supabase/supabase-js';
-
+import { prisma } from '@/lib/db';
 import {
   sendTextMessage,
   sendTemplateMessage,
@@ -35,7 +28,6 @@ import {
   type InteractiveMessagePayload,
 } from '@/lib/whatsapp/interactive';
 import { decrypt, encrypt, isLegacyFormat } from '@/lib/whatsapp/encryption';
-import { supabaseAdmin } from '@/lib/flows/admin-client';
 import {
   sanitizePhoneForMeta,
   isValidE164,
@@ -55,8 +47,7 @@ export const VALID_MESSAGE_TYPES = [
 
 /**
  * Typed failure with a machine `code` and a suggested HTTP `status`.
- * Callers map it to their own response shape (`toErrorResponse` for
- * the dashboard route, the v1 envelope for the public endpoint).
+ * Callers map it to their own response shape.
  */
 export class SendMessageError extends Error {
   readonly code: string;
@@ -94,19 +85,10 @@ export interface SendMessageResult {
 }
 
 /**
- * Send a message in an existing conversation and persist it.
- *
- * `db` may be an RLS-scoped user client (dashboard) or the service-
- * role client (public API) — every query is filtered by `accountId`
- * either way, so tenancy holds regardless of which client is passed.
- */
-/**
  * Validate the message-shape params (type, required content, caption
  * cap) independently of any DB state, throwing `SendMessageError` on a
  * bad payload. Exported so a caller can reject a malformed request
- * *before* it finds-or-creates a contact/conversation — otherwise an
- * invalid payload leaves an orphan empty conversation behind. The send
- * core calls this too, so validation can't be skipped.
+ * *before* it finds-or-creates a contact/conversation.
  */
 export function validateSendMessageParams(params: {
   messageType: string;
@@ -148,8 +130,6 @@ export function validateSendMessageParams(params: {
     );
   }
 
-  // Interactive: validate the full structured payload against Meta's
-  // limits up front so a bad payload 400s before we touch Meta.
   if (messageType === 'interactive') {
     const result = validateInteractivePayload(interactivePayload);
     if (!result.ok) {
@@ -180,8 +160,45 @@ export function validateSendMessageParams(params: {
   }
 }
 
+/** Map a Prisma `MessageTemplate` row into the snake_case shape `meta-api.ts`/`template-send-builder.ts` expect. */
+function toTemplateRecord(row: {
+  id: string;
+  name: string;
+  category: string;
+  language: string | null;
+  headerType: string | null;
+  headerContent: string | null;
+  headerHandle: string | null;
+  headerMediaUrl: string | null;
+  bodyText: string;
+  footerText: string | null;
+  buttons: unknown;
+  status: string | null;
+  metaTemplateId: string | null;
+}): MessageTemplate {
+  return {
+    id: row.id,
+    // user_id has no equivalent in this gateway's schema; templates
+    // are account-scoped, not user-scoped. Cast satisfies the shared
+    // (wacrm-originated) type without reintroducing a human-user column.
+    user_id: '',
+    name: row.name,
+    category: row.category as MessageTemplate['category'],
+    language: row.language ?? undefined,
+    header_type: (row.headerType ?? undefined) as MessageTemplate['header_type'],
+    header_content: row.headerContent ?? undefined,
+    header_handle: row.headerHandle ?? undefined,
+    header_media_url: row.headerMediaUrl ?? undefined,
+    body_text: row.bodyText,
+    footer_text: row.footerText ?? undefined,
+    buttons: (row.buttons as MessageTemplate['buttons']) ?? undefined,
+    status: row.status as MessageTemplate['status'],
+    meta_template_id: row.metaTemplateId ?? undefined,
+    created_at: '',
+  };
+}
+
 export async function sendMessageToConversation(
-  db: SupabaseClient,
   accountId: string,
   params: SendMessageParams
 ): Promise<SendMessageResult> {
@@ -200,11 +217,7 @@ export async function sendMessageToConversation(
   } = params;
 
   if (!conversationId) {
-    throw new SendMessageError(
-      'bad_request',
-      'conversation_id is required',
-      400
-    );
+    throw new SendMessageError('bad_request', 'conversation_id is required', 400);
   }
 
   validateSendMessageParams({
@@ -215,46 +228,39 @@ export async function sendMessageToConversation(
     interactivePayload,
   });
 
+  // Credit check — reject early if wallet has no balance
+  const wallet = await prisma.accountWallet.findUnique({ where: { accountId } });
+  if (!wallet || wallet.balance <= 0) {
+    throw new SendMessageError(
+      'insufficient_credits',
+      'Insufficient WhatsApp credits. Please recharge your account.',
+      402
+    );
+  }
+
   const isMediaKind = (MEDIA_KINDS as readonly string[]).includes(messageType);
 
-  // Conversation + contact, account-scoped.
-  const { data: conversation, error: convError } = await db
-    .from('conversations')
-    .select('*, contact:contacts(*)')
-    .eq('id', conversationId)
-    .eq('account_id', accountId)
-    .single();
+  const conversation = await prisma.conversation.findFirst({
+    where: { id: conversationId, accountId },
+    include: { contact: true },
+  });
 
-  if (convError || !conversation) {
+  if (!conversation) {
     throw new SendMessageError('not_found', 'Conversation not found', 404);
   }
 
   const contact = conversation.contact;
   if (!contact?.phone) {
-    throw new SendMessageError(
-      'bad_request',
-      'Contact phone number not found',
-      400
-    );
+    throw new SendMessageError('bad_request', 'Contact phone number not found', 400);
   }
 
   const sanitizedPhone = sanitizePhoneForMeta(contact.phone);
   if (!isValidE164(sanitizedPhone)) {
-    throw new SendMessageError(
-      'bad_request',
-      'Invalid phone number format',
-      400
-    );
+    throw new SendMessageError('bad_request', 'Invalid phone number format', 400);
   }
 
-  // WhatsApp config, account-scoped.
-  const { data: config, error: configError } = await db
-    .from('whatsapp_config')
-    .select('*')
-    .eq('account_id', accountId)
-    .single();
-
-  if (configError || !config) {
+  const config = await prisma.whatsappConfig.findUnique({ where: { accountId } });
+  if (!config) {
     throw new SendMessageError(
       'whatsapp_not_configured',
       'WhatsApp not configured. Please set up your WhatsApp integration first.',
@@ -262,77 +268,68 @@ export async function sendMessageToConversation(
     );
   }
 
-  const accessToken = decrypt(config.access_token);
+  const accessToken = decrypt(config.accessToken);
 
   // Self-heal legacy CBC ciphertexts. Fire-and-forget; idempotent.
-  if (isLegacyFormat(config.access_token)) {
-    void db
-      .from('whatsapp_config')
-      .update({ access_token: encrypt(accessToken) })
-      .eq('id', config.id)
-      .then(({ error }: { error: { message: string } | null }) => {
-        if (error) {
-          console.warn(
-            '[send-message] access_token GCM upgrade failed:',
-            error.message
-          );
-        }
+  if (isLegacyFormat(config.accessToken)) {
+    void prisma.whatsappConfig
+      .update({ where: { id: config.id }, data: { accessToken: encrypt(accessToken) } })
+      .catch((err: unknown) => {
+        console.warn('[send-message] access_token GCM upgrade failed:', err);
       });
   }
 
   // Resolve the reply target to its Meta message_id. The parent must
-  // belong to this same conversation — otherwise a caller could quote
-  // messages they can't see by guessing UUIDs.
+  // belong to this same conversation.
   let contextMessageId: string | undefined;
   if (replyToMessageId) {
-    const { data: parent, error: parentError } = await db
-      .from('messages')
-      .select('message_id, conversation_id')
-      .eq('id', replyToMessageId)
-      .eq('conversation_id', conversationId)
-      .maybeSingle();
-
-    if (parentError || !parent) {
+    const parent = await prisma.message.findFirst({
+      where: { id: replyToMessageId, conversationId },
+      select: { messageId: true },
+    });
+    if (!parent) {
       throw new SendMessageError(
         'bad_request',
         'reply_to_message_id not found in this conversation',
         400
       );
     }
-    if (!parent.message_id) {
+    if (!parent.messageId) {
       console.warn(
         '[send-message] reply target has no Meta message_id; sending without context'
       );
     } else {
-      contextMessageId = parent.message_id;
+      contextMessageId = parent.messageId;
     }
   }
 
-  // Template row (for header + button components). isMessageTemplate
-  // guards against a malformed local row crashing the send-builder.
+  // Template row (for header + button components).
   let templateRow: MessageTemplate | null = null;
   if (messageType === 'template' && templateName) {
-    const { data } = await db
-      .from('message_templates')
-      .select('*')
-      .eq('account_id', accountId)
-      .eq('name', templateName)
-      .eq('language', templateLanguage || 'en_US')
-      .maybeSingle();
-    if (data && !isMessageTemplate(data)) {
-      throw new SendMessageError(
-        'template_malformed',
-        'Template row is malformed locally — run "Sync from Meta" in Settings to repair it.',
-        500
-      );
+    const row = await prisma.messageTemplate.findFirst({
+      where: {
+        accountId,
+        name: templateName,
+        language: templateLanguage || 'en_US',
+      },
+    });
+    if (row) {
+      const candidate = toTemplateRecord(row);
+      if (!isMessageTemplate(candidate)) {
+        throw new SendMessageError(
+          'template_malformed',
+          'Template row is malformed locally — run "Sync from Meta" to repair it.',
+          500
+        );
+      }
+      templateRow = candidate;
     }
-    templateRow = data ?? null;
   }
 
   const attempt = async (phone: string): Promise<string> => {
     if (messageType === 'template') {
       const result = await sendTemplateMessage({
-        phoneNumberId: config.phone_number_id,
+        phoneNumberId: config.phoneNumberId,
         accessToken,
         to: phone,
         templateName: templateName!,
@@ -346,7 +343,7 @@ export async function sendMessageToConversation(
     }
     if (isMediaKind) {
       const result = await sendMediaMessage({
-        phoneNumberId: config.phone_number_id,
+        phoneNumberId: config.phoneNumberId,
         accessToken,
         to: phone,
         kind: messageType as MediaKind,
@@ -361,7 +358,7 @@ export async function sendMessageToConversation(
       const p = interactivePayload!;
       if (p.kind === 'buttons') {
         const result = await sendInteractiveButtons({
-          phoneNumberId: config.phone_number_id,
+          phoneNumberId: config.phoneNumberId,
           accessToken,
           to: phone,
           bodyText: p.body,
@@ -373,7 +370,7 @@ export async function sendMessageToConversation(
         return result.messageId;
       }
       const result = await sendInteractiveList({
-        phoneNumberId: config.phone_number_id,
+        phoneNumberId: config.phoneNumberId,
         accessToken,
         to: phone,
         bodyText: p.body,
@@ -386,7 +383,7 @@ export async function sendMessageToConversation(
       return result.messageId;
     }
     const result = await sendTextMessage({
-      phoneNumberId: config.phone_number_id,
+      phoneNumberId: config.phoneNumberId,
       accessToken,
       to: phone,
       text: contentText!,
@@ -424,8 +421,7 @@ export async function sendMessageToConversation(
 
     if (lastError) throw lastError;
   } catch (err) {
-    const message =
-      err instanceof Error ? err.message : 'Unknown Meta API error';
+    const message = err instanceof Error ? err.message : 'Unknown Meta API error';
     console.error('[send-message] Meta send failed for all variants:', message);
     throw new SendMessageError('meta_error', `Meta API error: ${message}`, 502);
   }
@@ -434,83 +430,55 @@ export async function sendMessageToConversation(
     console.log(
       `[send-message] Auto-corrected contact phone: ${sanitizedPhone} → ${workingPhone}`
     );
-    await db
-      .from('contacts')
-      .update({ phone: workingPhone })
-      .eq('id', contact.id);
+    await prisma.contact.update({ where: { id: contact.id }, data: { phone: workingPhone } });
   }
 
-  // Persist the sent message. Field names MUST match the messages
-  // schema (see 001_initial_schema.sql).
-  // Interactive messages persist the body as content_text (so the
-  // conversation-list preview reads sensibly) plus the full structured
-  // payload so the thread can re-render the buttons / rows.
   const interactiveBody =
     messageType === 'interactive' ? interactivePayload!.body : null;
 
-  const { data: messageRecord, error: msgError } = await db
-    .from('messages')
-    .insert({
-      conversation_id: conversationId,
-      sender_type: 'agent',
-      content_type: messageType,
-      content_text: interactiveBody ?? contentText ?? null,
-      media_url: mediaUrl || null,
-      template_name: templateName || null,
-      interactive_payload:
-        messageType === 'interactive' ? interactivePayload : null,
-      message_id: waMessageId,
+  const messageRecord = await prisma.message.create({
+    data: {
+      accountId,
+      conversationId,
+      senderType: 'agent',
+      contentType: messageType,
+      contentText: interactiveBody ?? contentText ?? null,
+      mediaUrl: mediaUrl || null,
+      templateName: templateName || null,
+      interactivePayload:
+        messageType === 'interactive'
+          ? (interactivePayload as unknown as object)
+          : undefined,
+      messageId: waMessageId,
       status: 'sent',
-      reply_to_message_id: replyToMessageId || null,
-    })
-    .select()
-    .single();
-
-  if (msgError) {
-    console.error('[send-message] error inserting sent message:', msgError);
-    throw new SendMessageError(
-      'db_error',
-      `Message sent to Meta but failed to save to DB: ${msgError.message}`,
-      500
-    );
-  }
+      replyToMessageId: replyToMessageId || null,
+    },
+  });
 
   const lastMessageText =
     messageType === 'interactive'
       ? interactivePayloadPreviewText(interactivePayload!)
       : contentText || `[${messageType}]`;
 
-  await db
-    .from('conversations')
-    .update({
-      last_message_text: lastMessageText,
-      last_message_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
-    })
-    .eq('id', conversationId);
+  await prisma.conversation.update({
+    where: { id: conversationId },
+    data: { lastMessageText, lastMessageAt: new Date() },
+  });
 
-  // Pause any active Flow run for this contact — the agent stepping in
-  // is the strongest "yield, human is here" signal. Best-effort.
-  try {
-    const { error: pauseErr } = await supabaseAdmin()
-      .from('flow_runs')
-      .update({
-        status: 'paused_by_agent',
-        ended_at: new Date().toISOString(),
-        end_reason: 'agent_replied',
-      })
-      .eq('account_id', accountId)
-      .eq('contact_id', contact.id)
-      .eq('status', 'active');
-    if (pauseErr) {
-      console.error('[flows] pause-on-agent-send failed:', pauseErr.message);
-    }
-  } catch (err) {
-    console.error(
-      '[flows] pause-on-agent-send threw:',
-      err instanceof Error ? err.message : err
-    );
-  }
+  // Deduct 1 credit after successful send
+  const updatedWallet = await prisma.accountWallet.update({
+    where: { accountId },
+    data: { balance: { decrement: 1 } },
+  });
+  await prisma.walletTransaction.create({
+    data: {
+      accountId,
+      type: 'DEBIT',
+      amount: 1,
+      balance: updatedWallet.balance,
+      description: `Message to ${contact.phone}`,
+    },
+  });
 
   return { messageId: messageRecord.id, whatsappMessageId: waMessageId };
 }

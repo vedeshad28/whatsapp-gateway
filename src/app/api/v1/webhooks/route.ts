@@ -1,18 +1,18 @@
 // ============================================================
-// GET  /api/v1/webhooks — list webhook endpoints (scope: webhooks:manage)
-// POST /api/v1/webhooks — register an endpoint    (scope: webhooks:manage)
+// GET  /api/v1/webhooks?account_id=<uuid> — list webhook endpoints (scope: webhooks:manage)
+// POST /api/v1/webhooks                    — register an endpoint    (scope: webhooks:manage)
 //
 // POST returns the signing `secret` in plaintext exactly once — store
-// it to verify the `X-Wacrm-Signature` on deliveries. wacrm keeps only
-// an encrypted copy and can never show it again.
+// it to verify the `X-Gateway-Signature` on deliveries. The gateway
+// keeps only an encrypted copy and can never show it again.
 // ============================================================
 
-import { requireApiKey } from '@/lib/auth/api-context';
+import { prisma } from '@/lib/db';
+import { requireApiKey, requireAccountAccess } from '@/lib/auth/api-context';
 import { ok, okList, fail, toApiErrorResponse } from '@/lib/api/v1/respond';
 import { encrypt } from '@/lib/whatsapp/encryption';
 import { normalizeEvents } from '@/lib/webhooks/events';
 import {
-  WEBHOOK_PUBLIC_COLUMNS,
   serializeWebhookEndpoint,
   generateWebhookSecret,
   normalizeWebhookUrl,
@@ -22,22 +22,28 @@ export async function GET(request: Request) {
   try {
     const ctx = await requireApiKey(request, 'webhooks:manage');
 
-    const { data, error } = await ctx.supabase
-      .from('webhook_endpoints')
-      .select(WEBHOOK_PUBLIC_COLUMNS)
-      .eq('account_id', ctx.accountId)
-      .order('created_at', { ascending: false });
-
-    if (error) {
-      console.error('[api/v1/webhooks] list error:', error);
-      return fail('internal', 'Failed to list webhooks', 500);
+    const accountId = new URL(request.url).searchParams.get('account_id') ?? '';
+    if (!accountId) {
+      return fail('bad_request', "'account_id' query param is required", 400);
     }
+    const account = await requireAccountAccess(ctx, accountId);
 
-    // The roster is small and settings-class — return it whole (the
-    // list envelope's cursor is always null here).
+    const rows = await prisma.webhookEndpoint.findMany({
+      where: { accountId: account.id },
+      orderBy: { createdAt: 'desc' },
+    });
+
     return okList(
-      (data ?? []).map((r) =>
-        serializeWebhookEndpoint(r as Record<string, unknown>)
+      rows.map((r) =>
+        serializeWebhookEndpoint({
+          id: r.id,
+          url: r.url,
+          events: r.events,
+          is_active: r.isActive,
+          last_delivery_at: r.lastDeliveryAt?.toISOString() ?? null,
+          failure_count: r.failureCount,
+          created_at: r.createdAt.toISOString(),
+        })
       ),
       null
     );
@@ -58,6 +64,12 @@ export async function POST(request: Request) {
       return fail('bad_request', 'Request body must be a JSON object', 400);
     }
 
+    const accountId = typeof body.account_id === 'string' ? body.account_id : '';
+    if (!accountId) {
+      return fail('bad_request', "'account_id' is required", 400);
+    }
+    const account = await requireAccountAccess(ctx, accountId);
+
     const url = normalizeWebhookUrl(body.url);
     if (!url) {
       return fail('bad_request', "'url' must be a valid https:// URL", 400);
@@ -74,26 +86,23 @@ export async function POST(request: Request) {
 
     const secret = generateWebhookSecret();
 
-    const { data: created, error } = await ctx.supabase
-      .from('webhook_endpoints')
-      .insert({
-        account_id: ctx.accountId,
-        created_by: ctx.createdBy,
-        url,
-        secret: encrypt(secret),
-        events,
-      })
-      .select(WEBHOOK_PUBLIC_COLUMNS)
-      .single();
+    const created = await prisma.webhookEndpoint.create({
+      data: { accountId: account.id, url, secret: encrypt(secret), events },
+    });
 
-    if (error || !created) {
-      console.error('[api/v1/webhooks] create error:', error);
-      return fail('internal', 'Failed to create webhook', 500);
-    }
-
-    // Secret shown exactly once.
     return ok(
-      { ...serializeWebhookEndpoint(created as Record<string, unknown>), secret },
+      {
+        ...serializeWebhookEndpoint({
+          id: created.id,
+          url: created.url,
+          events: created.events,
+          is_active: created.isActive,
+          last_delivery_at: created.lastDeliveryAt?.toISOString() ?? null,
+          failure_count: created.failureCount,
+          created_at: created.createdAt.toISOString(),
+        }),
+        secret,
+      },
       201
     );
   } catch (err) {

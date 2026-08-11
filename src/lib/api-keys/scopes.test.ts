@@ -23,8 +23,8 @@ describe('isApiScope', () => {
 describe('normalizeScopes', () => {
   it('passes a valid list through, de-duplicated', () => {
     expect(
-      normalizeScopes(['messages:send', 'messages:send', 'contacts:read'])
-    ).toEqual(['messages:send', 'contacts:read']);
+      normalizeScopes(['messages:send', 'messages:send', 'templates:manage'])
+    ).toEqual(['messages:send', 'templates:manage']);
   });
 
   it('treats an empty array as valid (key with no scopes)', () => {
@@ -43,13 +43,13 @@ describe('normalizeScopes', () => {
 
 describe('hasScope', () => {
   it('is true when the scope is present', () => {
-    expect(hasScope(['messages:send', 'contacts:read'], 'contacts:read')).toBe(
+    expect(hasScope(['messages:send', 'templates:manage'], 'templates:manage')).toBe(
       true
     );
   });
 
   it('is false when the scope is absent or the list is empty', () => {
-    expect(hasScope(['messages:send'], 'contacts:read')).toBe(false);
+    expect(hasScope(['messages:send'], 'templates:manage')).toBe(false);
     expect(hasScope([], 'messages:send')).toBe(false);
   });
 });

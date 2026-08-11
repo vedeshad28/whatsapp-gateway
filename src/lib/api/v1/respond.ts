@@ -65,6 +65,11 @@ export function badRequest(message: string): ApiError {
   return new ApiError('bad_request', message, 400);
 }
 
+/** 404 — no such resource, or it belongs to a different client. */
+export function notFound(message = 'Not found'): ApiError {
+  return new ApiError('not_found', message, 404);
+}
+
 /** 429 — built from a `checkRateLimit` miss, with the standard headers. */
 export function rateLimited(result: RateLimitResult): ApiError {
   const retryAfter = Math.max(1, Math.ceil((result.reset - Date.now()) / 1000));

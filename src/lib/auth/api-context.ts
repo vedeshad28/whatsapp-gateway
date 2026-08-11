@@ -1,61 +1,42 @@
 // ============================================================
-// Public API authentication — resolve a request's API key into an
-// account context.
+// Public API authentication — resolve a request's API key into a
+// client context, and (separately) resolve+verify a specific account
+// that context is allowed to act on.
 //
-// This is the machine-to-machine counterpart of `getCurrentAccount`
-// (cookie session → account). Where the dashboard authenticates a
-// human via Supabase cookies, the public API authenticates a caller
-// via `Authorization: Bearer wacrm_live_…`.
-//
-// Calling convention — every `/api/v1` route does:
+// Every `/api/v1` and `/api/whatsapp` route does:
 //
 //   try {
 //     const ctx = await requireApiKey(request, "messages:send");
-//     // ctx.supabase   — service-role client (no user session exists)
-//     // ctx.accountId  — the key's account; scope every query by it
-//     // ctx.scopes     — granted scopes
-//     // ctx.keyId      — for logging / the rate-limit bucket
+//     const accountId = await requireAccountAccess(ctx, requestedAccountId);
+//     // ctx.clientId — the key's owning client; scope every query by it
 //   } catch (err) {
-//     return toApiErrorResponse(err);   // maps ApiError → envelope
+//     return toApiErrorResponse(err);
 //   }
 //
-// Why a service-role client: an API caller has no Supabase session,
-// so there's no `auth.uid()` for RLS to match. The key lookup itself
-// establishes the account; from there every downstream query MUST be
-// explicitly filtered by `ctx.accountId` (the same discipline the
-// dashboard's send route already follows). The key never escalates
-// past its own account because the account is fixed at lookup time.
+// Semantic change from wacrm: a key authenticates a *Client* (the
+// calling application, e.g. salon-saas), not a single Account
+// directly. A Client can own many Accounts (one per connected WABA —
+// e.g. one per salon tenant). Every request that acts on an account
+// must pass that account's id explicitly, and `requireAccountAccess`
+// verifies it belongs to the authenticated client — this is the
+// tenancy boundary now that there's no human session / RLS to lean on.
 // ============================================================
 
-import type { SupabaseClient } from '@supabase/supabase-js';
-
-import { supabaseAdmin } from '@/lib/flows/admin-client';
+import { prisma } from '@/lib/db';
 import { findActiveKeyByHash, touchLastUsed } from '@/lib/api-keys/store';
 import { hashApiKey, looksLikeApiKey } from '@/lib/api-keys/keys';
 import { hasScope, type ApiScope } from '@/lib/api-keys/scopes';
-import { forbidden, rateLimited, unauthorized } from '@/lib/api/v1/respond';
+import { forbidden, notFound, unauthorized, rateLimited } from '@/lib/api/v1/respond';
 import { checkRateLimit, RATE_LIMITS } from '@/lib/rate-limit';
 
 export interface ApiKeyContext {
-  /** Discriminant — lets shared logic tell key auth from cookie auth. */
   authType: 'api_key';
-  /** Service-role Supabase client. RLS-bypassing; scope by accountId. */
-  supabase: SupabaseClient;
-  /** The account this key belongs to. */
-  accountId: string;
-  /** The key row id — for audit logging and the rate-limit bucket. */
+  /** The client this key belongs to. Every Account it touches must have this clientId. */
+  clientId: string;
   keyId: string;
-  /** Scopes granted to this key. */
   scopes: string[];
-  /** Who minted the key (null if that user was later removed). */
-  createdBy: string | null;
 }
 
-/**
- * Extract the bearer token from the `Authorization` header.
- * Tolerates the `Bearer ` prefix being absent (some clients send the
- * bare key) but requires the value to look like one of our keys.
- */
 function extractKey(request: Request): string | null {
   const header = request.headers.get('authorization');
   if (!header) return null;
@@ -66,16 +47,13 @@ function extractKey(request: Request): string | null {
 }
 
 /**
- * Authenticate a public-API request and (optionally) enforce a
- * single scope. Throws an `ApiError` (mapped to the envelope by
+ * Authenticate a public-API request and (optionally) enforce a single
+ * scope. Throws an `ApiError` (mapped to the envelope by
  * `toApiErrorResponse`) on any failure:
  *
  *   401 unauthorized — no key, malformed, unknown, revoked, expired
  *   403 forbidden    — valid key without the required scope
  *   429 rate_limited — per-key budget exhausted
- *
- * On success, bumps `last_used_at` (fire-and-forget) and returns the
- * account context.
  */
 export async function requireApiKey(
   request: Request,
@@ -88,14 +66,9 @@ export async function requireApiKey(
 
   const row = await findActiveKeyByHash(hashApiKey(presented));
   if (!row) {
-    // Covers unknown, revoked, and expired keys alike — we don't
-    // distinguish them on the wire so a probe can't learn whether a
-    // key ever existed.
     throw unauthorized();
   }
 
-  // Rate-limit per key, before the scope check, so an unauthorized-
-  // scope caller still can't hammer the endpoint for free.
   const limit = checkRateLimit(`apikey:${row.id}`, RATE_LIMITS.publicApi);
   if (!limit.success) {
     throw rateLimited(limit);
@@ -109,10 +82,28 @@ export async function requireApiKey(
 
   return {
     authType: 'api_key',
-    supabase: supabaseAdmin(),
-    accountId: row.account_id,
+    clientId: row.client_id,
     keyId: row.id,
     scopes: row.scopes,
-    createdBy: row.created_by,
   };
+}
+
+/**
+ * Verify `accountId` belongs to `ctx.clientId` and return it. Every
+ * route that acts on a specific account (send, connect, templates,
+ * webhooks) must call this before touching the account's data — it's
+ * the tenancy check that replaces wacrm's RLS.
+ *
+ * Throws 404 rather than 403 on a mismatch so a caller can't use the
+ * response to probe which account ids exist under another client.
+ */
+export async function requireAccountAccess(
+  ctx: ApiKeyContext,
+  accountId: string
+): Promise<{ id: string; externalRef: string | null; label: string | null }> {
+  const account = await prisma.account.findUnique({ where: { id: accountId } });
+  if (!account || account.clientId !== ctx.clientId) {
+    throw notFound('Account not found');
+  }
+  return { id: account.id, externalRef: account.externalRef, label: account.label };
 }
