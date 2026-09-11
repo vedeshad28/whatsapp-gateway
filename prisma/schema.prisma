@@ -19,11 +19,16 @@ datasource db {
 }
 
 model Client {
-  id        String    @id @default(uuid())
+  id        String     @id @default(uuid())
   name      String
-  createdAt DateTime  @default(now()) @map("created_at")
+  createdAt DateTime   @default(now()) @map("created_at")
   apiKeys   ApiKey[]
   accounts  Account[]
+  /// Present iff this Client is a human-facing CRM tenant (dashboard
+  /// signup created it). Absent for API-only clients like salon-saas —
+  /// nothing about the Client/ApiKey/Account/wallet auth path below
+  /// changes based on whether a Workspace exists on top of it.
+  workspace Workspace?
 
   @@map("clients")
 }
@@ -64,6 +69,15 @@ model Account {
   webhookEndpoints   WebhookEndpoint[]
   wallet             AccountWallet?
   walletTransactions WalletTransaction[]
+  pipelines          Pipeline[]
+  deals              Deal[]
+  tags               Tag[]
+  broadcasts         Broadcast[]
+  automations        Automation[]
+  flows              Flow[]
+  /// Set only if this Account was provisioned for salon-saas-tenant
+  /// dashboard login — see Workspace.linkedAccountId above.
+  linkedWorkspace    Workspace?
 
   @@unique([clientId, externalRef])
   @@map("accounts")
@@ -114,6 +128,7 @@ model MessageTemplate {
   submissionError String?   @map("submission_error")
   lastSubmittedAt DateTime? @map("last_submitted_at")
   createdAt       DateTime  @default(now()) @map("created_at")
+  broadcasts      Broadcast[]
 
   @@unique([accountId, name, language])
   @@map("message_templates")
@@ -125,9 +140,19 @@ model Contact {
   account       Account        @relation(fields: [accountId], references: [id], onDelete: Cascade)
   phone         String
   name          String?
+  /// Optional CRM fields — whitelisted subjects for Automations'
+  /// contact_field condition and Flows' condition node.
+  email         String?
+  company       String?
   createdAt     DateTime       @default(now()) @map("created_at")
   updatedAt     DateTime       @updatedAt @map("updated_at")
   conversations Conversation[]
+  deals         Deal[]
+  tags          ContactTag[]
+  broadcastRecipients BroadcastRecipient[]
+  automationLogs AutomationLog[]
+  automationPendingExecutions AutomationPendingExecution[]
+  flowRuns      FlowRun[]
 
   @@unique([accountId, phone])
   @@map("contacts")
@@ -141,9 +166,16 @@ model Conversation {
   contact         Contact   @relation(fields: [contactId], references: [id], onDelete: Cascade)
   lastMessageText String?   @map("last_message_text")
   lastMessageAt   DateTime? @map("last_message_at")
+  unreadCount     Int       @default(0) @map("unread_count")
+  /// 'open' | 'pending' | 'closed' — plain string, matching this
+  /// schema's existing convention for Message.status/senderType/
+  /// contentType (app-level validated, not a DB enum). Automations'
+  /// close_conversation step and Flows' handoff node write this.
+  status          String    @default("open")
   createdAt       DateTime  @default(now()) @map("created_at")
   updatedAt       DateTime  @updatedAt @map("updated_at")
   messages        Message[]
+  flowRuns        FlowRun[]
 
   @@unique([accountId, contactId])
   @@map("conversations")
@@ -163,6 +195,9 @@ model Message {
   /// Meta's wamid — used to correlate inbound status-update webhooks.
   messageId          String?      @map("message_id")
   status             String       @default("sending")
+  /// Human-readable failure reason from Meta's status webhook `errors[]`
+  /// (e.g. "outside the 24-hour window") — set only when status is 'failed'.
+  errorMessage       String?      @map("error_message")
   replyToMessageId   String?      @map("reply_to_message_id")
   interactivePayload Json?        @map("interactive_payload")
   createdAt          DateTime     @default(now()) @map("created_at")
@@ -212,4 +247,496 @@ model WebhookEndpoint {
 
   @@index([accountId])
   @@map("webhook_endpoints")
+}
+
+// ============================================================
+// CRM dashboard auth & team — added when the app grew a second mode
+// on top of the gateway (see prisma schema header comment history /
+// project docs). A `Workspace` is the human-facing wrapper around a
+// `Client`: signing up creates a `Client` + `Workspace` pair so that
+// dashboard users end up scoped by the exact same `clientId` that
+// `ApiKey`/`Account` already key off. salon-saas remains a bare
+// `Client` with no `Workspace` — nobody signs in to it, it only ever
+// authenticates via `ApiKey`.
+// ============================================================
+
+model User {
+  id              String                @id @default(uuid())
+  email           String                @unique
+  /// scrypt salt:hash — see src/lib/auth/password.ts.
+  passwordHash    String                @map("password_hash")
+  name            String?
+  avatarUrl       String?               @map("avatar_url")
+  createdAt       DateTime              @default(now()) @map("created_at")
+  sessions        Session[]
+  memberships     WorkspaceMember[]
+  sentInvitations WorkspaceInvitation[] @relation("WorkspaceInvitationInvitedBy")
+  assignedDeals   Deal[]
+  createdBroadcasts Broadcast[]
+  createdAutomations Automation[]
+
+  @@map("users")
+}
+
+/// A signed-in browser session. `tokenHash` mirrors `ApiKey.keyHash` —
+/// the plaintext token lives only in the `gateway_session` cookie,
+/// never persisted (see src/lib/auth/session.ts).
+model Session {
+  id        String   @id @default(uuid())
+  userId    String   @map("user_id")
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash String   @unique @map("token_hash")
+  expiresAt DateTime @map("expires_at")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([userId])
+  @@map("sessions")
+}
+
+enum WorkspaceRole {
+  owner
+  admin
+  agent
+  viewer
+}
+
+model Workspace {
+  id              String   @id @default(uuid())
+  clientId        String   @unique @map("client_id")
+  client          Client   @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  name            String
+  defaultCurrency String   @default("USD") @map("default_currency")
+  /// Set only for a Workspace provisioned via POST /api/v1/accounts/{id}/invite
+  /// (a salon-saas tenant's dashboard login) — points straight at the one
+  /// Account this Workspace's members should see, bypassing the
+  /// clientId+externalRef='workspace' sentinel lookup entirely. Null for
+  /// every standalone-CRM Workspace created via /api/auth/signup, which
+  /// keeps resolving its Account the existing way. See
+  /// resolveWorkspaceAccountId in src/lib/auth/workspace-account.ts.
+  linkedAccountId String?  @unique @map("linked_account_id")
+  linkedAccount   Account? @relation(fields: [linkedAccountId], references: [id], onDelete: Cascade)
+  createdAt       DateTime @default(now()) @map("created_at")
+
+  members     WorkspaceMember[]
+  invitations WorkspaceInvitation[]
+
+  @@map("workspaces")
+}
+
+model WorkspaceMember {
+  id          String        @id @default(uuid())
+  workspaceId String        @map("workspace_id")
+  workspace   Workspace     @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  userId      String        @map("user_id")
+  user        User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role        WorkspaceRole @default(agent)
+  createdAt   DateTime      @default(now()) @map("created_at")
+
+  @@unique([workspaceId, userId])
+  @@index([userId])
+  @@map("workspace_members")
+}
+
+model WorkspaceInvitation {
+  id          String        @id @default(uuid())
+  workspaceId String        @map("workspace_id")
+  workspace   Workspace     @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  email       String
+  role        WorkspaceRole @default(agent)
+  tokenHash   String        @unique @map("token_hash")
+  /// Null when the invite was created by an API key (salon-saas
+  /// provisioning a tenant's first login), not a signed-in user.
+  invitedById String?       @map("invited_by_id")
+  invitedBy   User?         @relation("WorkspaceInvitationInvitedBy", fields: [invitedById], references: [id])
+  expiresAt   DateTime      @map("expires_at")
+  redeemedAt  DateTime?     @map("redeemed_at")
+  createdAt   DateTime      @default(now()) @map("created_at")
+
+  @@index([workspaceId])
+  @@map("workspace_invitations")
+}
+
+// ============================================================
+// Pipelines & deals — scoped by `accountId` like Contact/Conversation/
+// Message, so a pipeline belongs to the same workspace-owned Account
+// as its contacts. Mirrors wacrm's pipelines/pipeline_stages/deals
+// design (migrations 001-002), ported onto Prisma.
+// ============================================================
+
+enum DealStatus {
+  open
+  won
+  lost
+}
+
+model Pipeline {
+  id        String          @id @default(uuid())
+  accountId String          @map("account_id")
+  account   Account         @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  name      String
+  createdAt DateTime        @default(now()) @map("created_at")
+  stages    PipelineStage[]
+  deals     Deal[]
+
+  @@index([accountId])
+  @@map("pipelines")
+}
+
+model PipelineStage {
+  id         String   @id @default(uuid())
+  pipelineId String   @map("pipeline_id")
+  pipeline   Pipeline @relation(fields: [pipelineId], references: [id], onDelete: Cascade)
+  name       String
+  position   Int
+  color      String?
+  createdAt  DateTime @default(now()) @map("created_at")
+  deals      Deal[]
+
+  @@index([pipelineId])
+  @@map("pipeline_stages")
+}
+
+model Deal {
+  id                String        @id @default(uuid())
+  accountId         String        @map("account_id")
+  account           Account       @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  pipelineId        String        @map("pipeline_id")
+  pipeline          Pipeline      @relation(fields: [pipelineId], references: [id], onDelete: Cascade)
+  stageId           String        @map("stage_id")
+  stage             PipelineStage @relation(fields: [stageId], references: [id], onDelete: Cascade)
+  contactId         String?       @map("contact_id")
+  contact           Contact?      @relation(fields: [contactId], references: [id], onDelete: SetNull)
+  title             String
+  /// Whole-currency-unit value (e.g. cents-free dollars) — see src/lib/currency.ts, values are tracked to the dollar across the app.
+  value             Int           @default(0)
+  currency          String        @default("USD")
+  notes             String?
+  expectedCloseDate DateTime?     @map("expected_close_date")
+  status            DealStatus    @default(open)
+  assignedToUserId  String?       @map("assigned_to_user_id")
+  assignedTo        User?         @relation(fields: [assignedToUserId], references: [id], onDelete: SetNull)
+  createdAt         DateTime      @default(now()) @map("created_at")
+  updatedAt         DateTime      @updatedAt @map("updated_at")
+
+  @@index([accountId])
+  @@index([pipelineId])
+  @@index([stageId])
+  @@map("deals")
+}
+
+// ============================================================
+// Tags — account-scoped labels applied to contacts, used for
+// broadcast audience filtering ("send to everyone tagged VIP") and
+// general contact organization. Pulled in ahead of Phase 4
+// (Broadcasts) specifically so broadcast audience selection isn't
+// limited to "all contacts."
+// ============================================================
+
+model Tag {
+  id        String       @id @default(uuid())
+  accountId String       @map("account_id")
+  account   Account      @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  name      String
+  color     String?
+  createdAt DateTime     @default(now()) @map("created_at")
+  contacts  ContactTag[]
+  broadcasts Broadcast[]
+
+  @@unique([accountId, name])
+  @@map("tags")
+}
+
+model ContactTag {
+  contactId String   @map("contact_id")
+  contact   Contact  @relation(fields: [contactId], references: [id], onDelete: Cascade)
+  tagId     String   @map("tag_id")
+  tag       Tag      @relation(fields: [tagId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@id([contactId, tagId])
+  @@index([tagId])
+  @@map("contact_tags")
+}
+
+// ============================================================
+// Broadcasts — send one approved MessageTemplate to many contacts at
+// once. Audience is "all contacts" (audienceTagId null) or everyone
+// carrying a given Tag. Sending runs in-process, fire-and-forget (see
+// src/lib/whatsapp/broadcast-send.ts) — BroadcastRecipient.status
+// tracks each send's progress, including delivered/read synced back
+// from the same inbound-webhook handler that already mirrors status
+// to salon-saas (additive-only there, see handleStatusUpdate).
+// ============================================================
+
+enum BroadcastStatus {
+  sending
+  completed
+  failed
+}
+
+enum BroadcastRecipientStatus {
+  pending
+  sent
+  delivered
+  read
+  failed
+}
+
+model Broadcast {
+  id                String            @id @default(uuid())
+  accountId         String            @map("account_id")
+  account           Account           @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  name              String
+  templateId        String            @map("template_id")
+  template          MessageTemplate   @relation(fields: [templateId], references: [id], onDelete: Restrict)
+  audienceTagId     String?           @map("audience_tag_id")
+  audienceTag       Tag?              @relation(fields: [audienceTagId], references: [id], onDelete: SetNull)
+  /// Fixed values for template {{n}} body variables not driven by contact data — e.g. {"2": "20% off"}.
+  bodyParams        Json?             @map("body_params")
+  /// 1-indexed body {{n}} position to fill with each contact's own name, if any.
+  useContactNameVar Int?              @map("use_contact_name_var")
+  /// Send-time override for an image/video/document header with no
+  /// stored header_media_url on the template itself — same recipient
+  /// value for the whole broadcast (unlike salon-saas's per-customer
+  /// invoice PDFs, a broadcast sends identical content to everyone).
+  headerMediaUrl    String?           @map("header_media_url")
+  /// Document header filename shown to the recipient, if applicable.
+  headerFilename    String?           @map("header_filename")
+  /// Value for a text header's {{1}}, if the template's header needs one.
+  headerText        String?           @map("header_text")
+  status            BroadcastStatus   @default(sending)
+  totalRecipients   Int               @default(0) @map("total_recipients")
+  sentCount         Int               @default(0) @map("sent_count")
+  failedCount       Int               @default(0) @map("failed_count")
+  createdByUserId   String            @map("created_by_user_id")
+  createdBy         User              @relation(fields: [createdByUserId], references: [id], onDelete: Restrict)
+  createdAt         DateTime          @default(now()) @map("created_at")
+  completedAt       DateTime?         @map("completed_at")
+  recipients        BroadcastRecipient[]
+
+  @@index([accountId])
+  @@map("broadcasts")
+}
+
+model BroadcastRecipient {
+  id           String                    @id @default(uuid())
+  broadcastId  String                    @map("broadcast_id")
+  broadcast    Broadcast                 @relation(fields: [broadcastId], references: [id], onDelete: Cascade)
+  contactId    String                    @map("contact_id")
+  contact      Contact                   @relation(fields: [contactId], references: [id], onDelete: Cascade)
+  status       BroadcastRecipientStatus  @default(pending)
+  /// The created Message.id once sent — the webhook status-sync hook looks up rows by this.
+  messageId    String?                   @map("message_id")
+  errorMessage String?                   @map("error_message")
+  sentAt       DateTime?                 @map("sent_at")
+  createdAt    DateTime                  @default(now()) @map("created_at")
+
+  @@unique([broadcastId, contactId])
+  @@index([broadcastId])
+  @@index([messageId])
+  @@map("broadcast_recipients")
+}
+
+// ============================================================
+// Automations — trigger → (branching) step-tree rules. Ported from
+// wacrm's pre-trim supabase/migrations/006/007_automations*.sql,
+// keyed by accountId from the start (every other CRM table here
+// already does — no need to replicate wacrm's historical
+// user_id→account_id migration).
+// ============================================================
+
+model Automation {
+  id               String    @id @default(uuid())
+  accountId        String    @map("account_id")
+  account          Account   @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  name             String
+  description      String?
+  /// 'new_message_received' | 'first_inbound_message' | 'keyword_match'
+  /// | 'new_contact_created' | 'conversation_assigned' | 'tag_added'
+  /// | 'time_based' | 'interactive_reply'
+  triggerType      String    @map("trigger_type")
+  triggerConfig    Json      @default("{}") @map("trigger_config")
+  isActive         Boolean   @default(false) @map("is_active")
+  executionCount   Int       @default(0) @map("execution_count")
+  lastExecutedAt   DateTime? @map("last_executed_at")
+  createdByUserId  String    @map("created_by_user_id")
+  createdBy        User      @relation(fields: [createdByUserId], references: [id], onDelete: Restrict)
+  createdAt        DateTime  @default(now()) @map("created_at")
+  updatedAt        DateTime  @updatedAt @map("updated_at")
+
+  steps            AutomationStep[]
+  logs             AutomationLog[]
+  pendingExecutions AutomationPendingExecution[]
+
+  @@index([accountId, triggerType])
+  @@map("automations")
+}
+
+model AutomationStep {
+  id             String    @id @default(uuid())
+  automationId   String    @map("automation_id")
+  automation     Automation @relation(fields: [automationId], references: [id], onDelete: Cascade)
+  /// Null for a root step. Set for a step nested inside a `condition`
+  /// step's yes/no branch.
+  parentStepId   String?   @map("parent_step_id")
+  parentStep     AutomationStep? @relation("AutomationStepChildren", fields: [parentStepId], references: [id], onDelete: Cascade)
+  childSteps     AutomationStep[] @relation("AutomationStepChildren")
+  /// 'yes' | 'no' — only set when parentStepId is set.
+  branch         String?
+  /// send_message | send_buttons | send_list | send_template | add_tag
+  /// | remove_tag | assign_conversation | update_contact_field |
+  /// create_deal | wait | condition | send_webhook | close_conversation
+  stepType       String    @map("step_type")
+  stepConfig     Json      @default("{}") @map("step_config")
+  position       Int
+  createdAt      DateTime  @default(now()) @map("created_at")
+
+  pendingExecutions AutomationPendingExecution[]
+
+  @@index([automationId])
+  @@index([parentStepId])
+  @@map("automation_steps")
+}
+
+model AutomationLog {
+  id            String    @id @default(uuid())
+  automationId  String    @map("automation_id")
+  automation    Automation @relation(fields: [automationId], references: [id], onDelete: Cascade)
+  contactId     String?   @map("contact_id")
+  contact       Contact?  @relation(fields: [contactId], references: [id], onDelete: SetNull)
+  triggerEvent  String    @map("trigger_event")
+  stepsExecuted Json      @default("[]") @map("steps_executed")
+  /// 'success' | 'partial' | 'failed'
+  status        String
+  errorMessage  String?   @map("error_message")
+  createdAt     DateTime  @default(now()) @map("created_at")
+
+  pendingExecutions AutomationPendingExecution[]
+
+  @@index([automationId])
+  @@map("automation_logs")
+}
+
+/// The `wait`-step suspension queue — drained by GET /api/automations/cron.
+model AutomationPendingExecution {
+  id               String    @id @default(uuid())
+  automationId     String    @map("automation_id")
+  automation       Automation @relation(fields: [automationId], references: [id], onDelete: Cascade)
+  contactId        String?   @map("contact_id")
+  contact          Contact?  @relation(fields: [contactId], references: [id], onDelete: SetNull)
+  logId            String    @map("log_id")
+  log              AutomationLog @relation(fields: [logId], references: [id], onDelete: Cascade)
+  parentStepId     String?   @map("parent_step_id")
+  parentStep       AutomationStep? @relation(fields: [parentStepId], references: [id], onDelete: SetNull)
+  branch           String?
+  nextStepPosition Int       @map("next_step_position")
+  context          Json      @default("{}")
+  /// 'pending' | 'running' | 'done' | 'failed'
+  status           String    @default("pending")
+  runAt            DateTime  @map("run_at")
+  createdAt        DateTime  @default(now()) @map("created_at")
+
+  @@index([status, runAt])
+  @@map("automation_pending_executions")
+}
+
+// ============================================================
+// Flows — stateful per-contact conversation graphs. Ported from
+// wacrm's pre-trim supabase/migrations/010/012/016_flow*.sql.
+// Edges live inside each node's own `config` JSON (e.g. a button
+// carries its own next_node_key) rather than a separate edges table —
+// the runner only ever needs one-row "given node X + reply Y, where
+// next" lookups, ported as designed.
+// ============================================================
+
+model Flow {
+  id             String    @id @default(uuid())
+  accountId      String    @map("account_id")
+  account        Account   @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  name           String
+  description    String?
+  /// 'draft' | 'active' | 'archived'
+  status         String    @default("draft")
+  /// 'keyword' | 'first_inbound_message' | 'manual'
+  triggerType    String    @map("trigger_type")
+  triggerConfig  Json      @default("{}") @map("trigger_config")
+  /// A FlowNode.nodeKey — not a real FK, node_key is only unique per-flow.
+  entryNodeId    String?   @map("entry_node_id")
+  /// Defaults applied in code, not here: {"on_unknown_reply":"reprompt",
+  /// "max_reprompts":2,"on_timeout_hours":24,"on_exhaust":"handoff"}
+  fallbackPolicy Json?     @map("fallback_policy")
+  executionCount Int       @default(0) @map("execution_count")
+  lastExecutedAt DateTime? @map("last_executed_at")
+  createdAt      DateTime  @default(now()) @map("created_at")
+  updatedAt      DateTime  @updatedAt @map("updated_at")
+
+  nodes          FlowNode[]
+  runs           FlowRun[]
+
+  @@index([accountId, triggerType])
+  @@map("flows")
+}
+
+model FlowNode {
+  id         String   @id @default(uuid())
+  flowId     String   @map("flow_id")
+  flow       Flow     @relation(fields: [flowId], references: [id], onDelete: Cascade)
+  nodeKey    String   @map("node_key")
+  /// start | send_message | send_buttons | send_list | send_media |
+  /// collect_input | condition | set_tag | handoff | end
+  nodeType   String   @map("node_type")
+  config     Json     @default("{}")
+  positionX  Int      @default(0) @map("position_x")
+  positionY  Int      @default(0) @map("position_y")
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  @@unique([flowId, nodeKey])
+  @@map("flow_nodes")
+}
+
+model FlowRun {
+  id                 String    @id @default(uuid())
+  flowId             String    @map("flow_id")
+  flow               Flow      @relation(fields: [flowId], references: [id], onDelete: Cascade)
+  accountId          String    @map("account_id")
+  contactId          String?   @map("contact_id")
+  contact            Contact?  @relation(fields: [contactId], references: [id], onDelete: SetNull)
+  conversationId     String?   @map("conversation_id")
+  conversation       Conversation? @relation(fields: [conversationId], references: [id], onDelete: SetNull)
+  /// active | completed | handed_off | timed_out | paused_by_agent | failed
+  status             String
+  currentNodeKey     String?   @map("current_node_key")
+  lastPromptMessageId String?  @map("last_prompt_message_id")
+  vars               Json      @default("{}")
+  repromptCount      Int       @default(0) @map("reprompt_count")
+  startedAt          DateTime  @default(now()) @map("started_at")
+  lastAdvancedAt     DateTime  @default(now()) @map("last_advanced_at")
+  endedAt            DateTime? @map("ended_at")
+  endReason          String?   @map("end_reason")
+
+  events             FlowRunEvent[]
+
+  // NOTE: the load-bearing "one active run per contact" constraint is a
+  // PARTIAL unique index (WHERE status='active') — not expressible in
+  // the Prisma schema DSL. Hand-authored in the migration SQL instead:
+  //   CREATE UNIQUE INDEX idx_one_active_run_per_contact
+  //     ON flow_runs(account_id, contact_id) WHERE status = 'active';
+  @@index([accountId, contactId])
+  @@index([status, lastAdvancedAt])
+  @@map("flow_runs")
+}
+
+model FlowRunEvent {
+  id         String   @id @default(uuid())
+  flowRunId  String   @map("flow_run_id")
+  flowRun    FlowRun  @relation(fields: [flowRunId], references: [id], onDelete: Cascade)
+  /// started | node_entered | message_sent | reply_received |
+  /// fallback_fired | handoff | timeout | error | completed
+  eventType  String   @map("event_type")
+  nodeKey    String?  @map("node_key")
+  payload    Json?
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  @@index([flowRunId])
+  @@map("flow_run_events")
 }

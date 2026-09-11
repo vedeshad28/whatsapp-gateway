@@ -23,6 +23,10 @@ import {
   type MediaKind,
 } from '@/lib/whatsapp/meta-api';
 import {
+  renderTemplateBodyText,
+  type SendTimeParams,
+} from '@/lib/whatsapp/template-send-builder';
+import {
   validateInteractivePayload,
   interactivePayloadPreviewText,
   type InteractiveMessagePayload,
@@ -75,6 +79,12 @@ export interface SendMessageParams {
   /** Structured payload for `messageType === 'interactive'`. */
   interactivePayload?: InteractiveMessagePayload | null;
   replyToMessageId?: string | null;
+  /**
+   * Defaults to 'agent' (every existing caller's behavior, unchanged).
+   * Automations/Flows pass 'bot' so the Inbox can visually distinguish
+   * a rule-sent message from a human agent's.
+   */
+  senderType?: string;
 }
 
 export interface SendMessageResult {
@@ -214,6 +224,7 @@ export async function sendMessageToConversation(
     templateMessageParams,
     interactivePayload,
     replyToMessageId,
+    senderType = 'agent',
   } = params;
 
   if (!conversationId) {
@@ -436,13 +447,26 @@ export async function sendMessageToConversation(
   const interactiveBody =
     messageType === 'interactive' ? interactivePayload!.body : null;
 
+  // Best-effort rendered text for template sends, so the Inbox shows
+  // the actual message instead of a bare "[template]" placeholder.
+  // Mirrors the exact fallback meta-api.ts uses to build the real
+  // send payload (messageParams?.body ?? params), so this reproduces
+  // what was actually sent — display-only, never touches the send.
+  const renderedTemplateText =
+    messageType === 'template' && templateRow
+      ? renderTemplateBodyText(
+          templateRow.body_text,
+          (templateMessageParams as SendTimeParams | undefined)?.body ?? templateParams ?? []
+        )
+      : null;
+
   const messageRecord = await prisma.message.create({
     data: {
       accountId,
       conversationId,
-      senderType: 'agent',
+      senderType,
       contentType: messageType,
-      contentText: interactiveBody ?? contentText ?? null,
+      contentText: interactiveBody ?? contentText ?? renderedTemplateText ?? null,
       mediaUrl: mediaUrl || null,
       templateName: templateName || null,
       interactivePayload:
@@ -458,7 +482,7 @@ export async function sendMessageToConversation(
   const lastMessageText =
     messageType === 'interactive'
       ? interactivePayloadPreviewText(interactivePayload!)
-      : contentText || `[${messageType}]`;
+      : contentText || renderedTemplateText || `[${messageType}]`;
 
   await prisma.conversation.update({
     where: { id: conversationId },

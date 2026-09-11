@@ -65,6 +65,32 @@ const SECURITY_HEADERS = [
 
 const nextConfig: NextConfig = {
   /**
+   * Dev-tunnel workaround, not a permanent architectural decision.
+   *
+   * ngrok's free tier only allows one active tunnel, and the one
+   * tunnel already forwards here (port 3001) for Meta's webhook
+   * callbacks. salon-saas's invoice-send flow separately needs a
+   * *publicly fetchable* URL for Meta to download the invoice PDF
+   * from (see WhatsAppInvoiceSendService.java's `publicBaseUrl` +
+   * `/api/v1/invoices/pdf-public/{token}`), and salon-saas's own
+   * backend (port 8081) has no tunnel of its own.
+   *
+   * Rather than a second tunnel (not available on the free plan),
+   * proxy just this one path through the gateway's existing tunnel to
+   * salon-saas's backend. Meta only ever sees this gateway's public
+   * hostname; the actual PDF bytes still come straight from
+   * salon-saas, this app never touches the response body.
+   */
+  async rewrites() {
+    return [
+      {
+        source: '/api/v1/invoices/pdf-public/:token',
+        destination: 'http://localhost:8081/api/v1/invoices/pdf-public/:token',
+      },
+    ];
+  },
+
+  /**
    * Cache-Control policy.
    *
    * Why this exists:

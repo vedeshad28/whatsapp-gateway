@@ -149,6 +149,17 @@ function buildBodyComponent(
   };
 }
 
+/**
+ * Render a template's body text for display, substituting {{n}}
+ * placeholders with the send-time values. Best-effort — leaves a
+ * placeholder untouched if no value was supplied, rather than
+ * throwing (this is a display-only render, not the validated send
+ * path in buildBodyComponent above).
+ */
+export function renderTemplateBodyText(bodyText: string, values: string[]): string {
+  return bodyText.replace(/\{\{(\d+)\}\}/g, (match, n) => values[Number(n) - 1] ?? match);
+}
+
 function buttonNeedsSendParam(
   button: TemplateButton,
   override: string | undefined,
