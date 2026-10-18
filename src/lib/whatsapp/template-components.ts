@@ -17,6 +17,10 @@ export interface MetaComponent {
   type: 'HEADER' | 'BODY' | 'FOOTER' | 'BUTTONS';
   format?: 'TEXT' | 'IMAGE' | 'VIDEO' | 'DOCUMENT';
   text?: string;
+  /** AUTHENTICATION BODY only: append Meta's "do not share this code" line. */
+  add_security_recommendation?: boolean;
+  /** AUTHENTICATION FOOTER only: the "code expires in N minutes" line. */
+  code_expiration_minutes?: number;
   buttons?: MetaButtonPayload[];
   example?: {
     header_text?: string[];
@@ -27,7 +31,9 @@ export interface MetaComponent {
 }
 
 interface MetaButtonPayload {
-  type: 'QUICK_REPLY' | 'URL' | 'PHONE_NUMBER' | 'COPY_CODE';
+  type: 'QUICK_REPLY' | 'URL' | 'PHONE_NUMBER' | 'COPY_CODE' | 'OTP';
+  /** OTP buttons only. */
+  otp_type?: 'COPY_CODE';
   text: string;
   url?: string;
   phone_number?: string;
@@ -103,6 +109,8 @@ function buildButtonPayload(b: TemplateButton): MetaButtonPayload {
       return { type: 'PHONE_NUMBER', text: b.text, phone_number: b.phone_number };
     case 'COPY_CODE':
       return { type: 'COPY_CODE', text: b.text, example: [b.example] };
+    case 'OTP':
+      return { type: 'OTP', otp_type: 'COPY_CODE', text: b.text };
   }
 }
 
@@ -151,5 +159,27 @@ export function buildMetaTemplatePayload(
     category: CATEGORY_TO_META[payload.category],
     language: payload.language,
     components,
+  };
+}
+
+/**
+ * Meta payload for an AUTHENTICATION template. The wording is Meta's, not ours: the body carries no
+ * text (Meta renders "{{1}} is your verification code."), only flags for the optional lines.
+ */
+export function buildAuthenticationMetaPayload(
+  name: string,
+  language: string,
+  expiryMinutes: number,
+  buttonText: string,
+): MetaTemplateSubmitPayload {
+  return {
+    name,
+    category: 'AUTHENTICATION',
+    language,
+    components: [
+      { type: 'BODY', add_security_recommendation: true },
+      { type: 'FOOTER', code_expiration_minutes: expiryMinutes },
+      { type: 'BUTTONS', buttons: [{ type: 'OTP', otp_type: 'COPY_CODE', text: buttonText }] },
+    ],
   };
 }

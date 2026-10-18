@@ -218,7 +218,13 @@ export type TemplateButton =
   | { type: 'QUICK_REPLY'; text: string }
   | { type: 'URL'; text: string; url: string; example?: string }
   | { type: 'PHONE_NUMBER'; text: string; phone_number: string }
-  | { type: 'COPY_CODE'; text: string; example: string };
+  | { type: 'COPY_CODE'; text: string; example: string }
+  /**
+   * The "Copy code" button of an AUTHENTICATION template. Not the same as COPY_CODE (a promo-code
+   * button on marketing templates): Meta expects the one-time code back as a `url`-type button
+   * parameter at send time, and the template text itself is fixed by Meta.
+   */
+  | { type: 'OTP'; text: string };
 
 export interface TemplateSampleValues {
   body?: string[];

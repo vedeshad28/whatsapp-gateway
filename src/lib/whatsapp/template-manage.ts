@@ -22,8 +22,12 @@ import {
   editMessageTemplate,
   deleteMessageTemplate,
 } from '@/lib/whatsapp/meta-api';
-import { validateTemplatePayload, type TemplatePayload } from '@/lib/whatsapp/template-validators';
-import { buildMetaTemplatePayload } from '@/lib/whatsapp/template-components';
+import {
+  validateTemplateName,
+  validateTemplatePayload,
+  type TemplatePayload,
+} from '@/lib/whatsapp/template-validators';
+import { buildAuthenticationMetaPayload, buildMetaTemplatePayload } from '@/lib/whatsapp/template-components';
 import { ensureImageHeaderHandle } from '@/lib/whatsapp/template-header-handle';
 import { normalizeStatus } from '@/lib/whatsapp/template-status-normalize';
 import type { TemplateButton, TemplateSampleValues } from '@/types';
@@ -136,6 +140,66 @@ export async function submitTemplate(accountId: string, payload: TemplatePayload
     update: buildRow(accountId, payload, { status: normalizeStatus(metaStatus), metaTemplateId, submissionError: null }),
   });
 
+  return { template: row, dry_run: isDryRun() };
+}
+
+/**
+ * Submits an AUTHENTICATION (one-time-code) template. Meta fixes the wording of these — the body
+ * is "{{1}} is your verification code." plus optional security / expiry lines — so the caller only
+ * chooses the expiry and button label, and the regular editor-driven `submitTemplate` (which
+ * rejects this category) is bypassed on purpose.
+ */
+export async function submitAuthenticationTemplate(
+  accountId: string,
+  opts: { name: string; language: string; expiryMinutes: number; buttonText?: string }
+) {
+  validateTemplateName(opts.name);
+  const buttonText = opts.buttonText ?? 'Copy code';
+  const payload: TemplatePayload = {
+    name: opts.name,
+    category: 'Authentication',
+    language: opts.language,
+    // What Meta renders, stored so the dashboard shows something meaningful and sends know there is one variable.
+    body_text: '{{1}} is your verification code. For your security, do not share it.',
+    footer_text: `This code expires in ${opts.expiryMinutes} minutes.`,
+    buttons: [{ type: 'OTP', text: buttonText }],
+  };
+
+  let metaTemplateId: string;
+  let metaStatus: string;
+
+  if (isDryRun()) {
+    metaTemplateId = `dry-run-${randomUUID()}`;
+    metaStatus = 'PENDING';
+  } else {
+    const config = await prisma.whatsappConfig.findUnique({ where: { accountId } });
+    if (!config) throw new TemplateManageError('bad_request', 'WhatsApp not configured for this account.', 400);
+    if (!config.wabaId) throw new TemplateManageError('bad_request', 'WABA ID missing — reconnect the account.', 400);
+    const accessToken = decrypt(config.accessToken);
+    try {
+      const meta = await submitMessageTemplate({
+        wabaId: config.wabaId,
+        accessToken,
+        payload: buildAuthenticationMetaPayload(opts.name, opts.language, opts.expiryMinutes, buttonText),
+      });
+      metaTemplateId = meta.id;
+      metaStatus = meta.status;
+    } catch (e) {
+      const message = e instanceof Error ? e.message : 'Meta submit failed';
+      await prisma.messageTemplate.upsert({
+        where: { accountId_name_language: { accountId, name: opts.name, language: opts.language } },
+        create: buildRow(accountId, payload, { status: 'DRAFT', metaTemplateId: null, submissionError: message }),
+        update: buildRow(accountId, payload, { status: 'DRAFT', metaTemplateId: null, submissionError: message }),
+      });
+      throw new TemplateManageError('meta_error', message, 502);
+    }
+  }
+
+  const row = await prisma.messageTemplate.upsert({
+    where: { accountId_name_language: { accountId, name: opts.name, language: opts.language } },
+    create: buildRow(accountId, payload, { status: normalizeStatus(metaStatus), metaTemplateId, submissionError: null }),
+    update: buildRow(accountId, payload, { status: normalizeStatus(metaStatus), metaTemplateId, submissionError: null }),
+  });
   return { template: row, dry_run: isDryRun() };
 }
 
@@ -295,6 +359,10 @@ function parseButtons(metaButtons: MetaButton[] | undefined): TemplateButton[] {
         break;
       case 'COPY_CODE':
         out.push({ type: 'COPY_CODE', text: b.text, example: Array.isArray(b.example) ? b.example[0] ?? '' : b.example ?? '' });
+        break;
+      case 'OTP':
+        // Authentication templates' copy-code button (Meta reports it as type OTP).
+        out.push({ type: 'OTP', text: b.text });
         break;
     }
   }

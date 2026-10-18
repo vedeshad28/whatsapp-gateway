@@ -132,7 +132,10 @@ function buildBodyComponent(
   template: MessageTemplate,
   params: SendTimeParams,
 ): MetaSendComponent | null {
-  const varCount = extractVariableIndices(template.body_text).length;
+  // An authentication template always has exactly one body variable (the code), whatever text
+  // Meta reports back for it — a synced row can come back without the {{1}} placeholder.
+  const varCount =
+    template.category === 'Authentication' ? 1 : extractVariableIndices(template.body_text).length;
   const body = params.body ?? [];
   if (varCount === 0 && body.length === 0) return null;
   if (body.length < varCount) {
@@ -172,6 +175,9 @@ function buttonNeedsSendParam(
       // gets a real code (either the caller's override or the
       // template's example as a default).
       return true;
+    case 'OTP':
+      // An authentication template's copy-code button always needs the code.
+      return true;
     case 'QUICK_REPLY':
     case 'PHONE_NUMBER':
       return override !== undefined;
@@ -208,6 +214,22 @@ function buildButtonComponent(
         sub_type: 'copy_code',
         index: String(index),
         parameters: [{ type: 'coupon_code', coupon_code: code }],
+      };
+    }
+    case 'OTP': {
+      // Meta's authentication copy-code button is addressed as a URL-type button whose single
+      // text parameter is the code. There is deliberately no template-example fallback: sending
+      // a stale example code to a customer would be worse than failing the send.
+      if (!override || !override.trim()) {
+        throw new Error(
+          `Authentication template button #${index + 1} needs the code — pass buttonParams[${index}].`,
+        );
+      }
+      return {
+        type: 'button',
+        sub_type: 'url',
+        index: String(index),
+        parameters: [{ type: 'text', text: override }],
       };
     }
     case 'QUICK_REPLY': {
