@@ -290,6 +290,71 @@ export async function getSubscribedApps(
 }
 
 // ============================================================
+// Coexistence (WhatsApp Business app + Cloud API on one number)
+// ============================================================
+//
+// A coexistence signup finishes with only a `waba_id` (no
+// phone_number_id) and the number is already live in the Business
+// app, so it must NOT be passed through POST /register. After
+// subscribing the WABA, contacts and chat history are each requested
+// exactly once, within 24 hours of onboarding.
+
+export interface ListWabaPhoneNumbersArgs {
+  wabaId: string
+  accessToken: string
+}
+
+/** Phone numbers on a WABA — how a coexistence signup's phone_number_id is found. */
+export async function listWabaPhoneNumbers(
+  args: ListWabaPhoneNumbersArgs
+): Promise<MetaPhoneInfo[]> {
+  const { wabaId, accessToken } = args
+  const url = `${META_API_BASE}/${wabaId}/phone_numbers?fields=id,display_phone_number,verified_name,quality_rating`
+  const response = await fetch(url, {
+    headers: { Authorization: `Bearer ${accessToken}` },
+  })
+  if (!response.ok) {
+    await throwMetaError(response, `Meta API error: ${response.status}`)
+  }
+  const data = (await response.json()) as { data?: MetaPhoneInfo[] }
+  return data.data ?? []
+}
+
+export type SmbSyncType = 'smb_app_state_sync' | 'history'
+
+export interface RequestSmbAppDataSyncArgs {
+  phoneNumberId: string
+  accessToken: string
+  /** `smb_app_state_sync` pulls contacts; `history` pulls up to 180 days of chats. */
+  syncType: SmbSyncType
+}
+
+/**
+ * Ask Meta to push the Business app's contacts or chat history to our
+ * webhook. Meta allows each only once per onboarding; the result lands
+ * as `smb_app_state_sync` / `history` webhook events.
+ */
+export async function requestSmbAppDataSync(
+  args: RequestSmbAppDataSyncArgs
+): Promise<{ requestId?: string }> {
+  const { phoneNumberId, accessToken, syncType } = args
+  const url = `${META_API_BASE}/${phoneNumberId}/smb_app_data`
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${accessToken}`,
+    },
+    body: JSON.stringify({ messaging_product: 'whatsapp', sync_type: syncType }),
+  })
+  if (!response.ok) {
+    await throwMetaError(response, `Meta API error: ${response.status}`)
+  }
+  const data = (await response.json()) as { request_id?: string }
+  return { requestId: data.request_id }
+}
+
+// ============================================================
 // Sending
 // ============================================================
 

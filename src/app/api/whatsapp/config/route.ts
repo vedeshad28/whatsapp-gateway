@@ -55,6 +55,7 @@ export async function POST(request: Request) {
         code: typeof body.code === 'string' ? body.code : undefined,
         accessToken: typeof body.access_token === 'string' ? body.access_token : '',
         pin: typeof body.pin === 'string' ? body.pin : undefined,
+        coexistence: body.coexistence === true,
       });
       return ok(result);
     } catch (err) {

@@ -116,6 +116,7 @@ export async function POST(request: Request) {
         wabaId: typeof body.waba_id === 'string' ? body.waba_id : null,
         accessToken: typeof body.access_token === 'string' ? body.access_token : '',
         pin: typeof body.pin === 'string' ? body.pin : undefined,
+        coexistence: body.coexistence === true,
       });
       return NextResponse.json({ data: { account_id: account.id, ...result } });
     } catch (err) {

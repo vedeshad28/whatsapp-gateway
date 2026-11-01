@@ -27,6 +27,10 @@ import {
   isTemplateWebhookField,
 } from '@/lib/whatsapp/template-webhook';
 import { runAutomationsForTrigger } from '@/lib/whatsapp/automations/engine';
+import {
+  handleCoexistenceWebhookChange,
+  isCoexistenceWebhookField,
+} from '@/lib/whatsapp/coexistence-webhook';
 
 export const maxDuration = 60;
 
@@ -129,6 +133,11 @@ async function processWebhook(body: { entry?: WhatsAppWebhookEntry[] }) {
     for (const change of entry.changes) {
       if (isTemplateWebhookField(change.field)) {
         await handleTemplateWebhookChange({ field: change.field, value: change.value as unknown });
+        continue;
+      }
+
+      if (isCoexistenceWebhookField(change.field)) {
+        await handleCoexistenceWebhookChange({ field: change.field, entryId: entry.id, value: change.value as unknown });
         continue;
       }
 
