@@ -23,6 +23,7 @@ import {
   requestSmbAppDataSync,
 } from '@/lib/whatsapp/meta-api';
 import { encrypt, decrypt } from '@/lib/whatsapp/encryption';
+import { deriveRegistrationPin } from '@/lib/whatsapp/registration-pin';
 import { ensureDefaultInvoiceTemplate } from '@/lib/whatsapp/default-invoice-template';
 
 export class ConnectAccountError extends Error {
@@ -189,13 +190,17 @@ export async function connectAccount(accountId: string, input: ConnectAccountInp
     registeredAt = existing?.registeredAt ?? new Date();
   }
 
+  // An Embedded Signup connect (a `code`, not a pasted token) has no PIN field, and Meta refuses to send
+  // from a number that was never registered ("Account not registered", #133010) — so register it with
+  // a PIN derived from a server secret. A typed PIN always wins.
+  const registrationPin = pin || (code ? deriveRegistrationPin(phoneNumberId) : null);
   const needsRegistration = !coexistence && (!sameNumber || Boolean(pin));
   if (needsRegistration) {
-    if (!pin) {
+    if (!registrationPin) {
       registrationSkipped = true;
     } else {
       try {
-        await registerPhoneNumber({ phoneNumberId, accessToken: accessTokenPlain, pin });
+        await registerPhoneNumber({ phoneNumberId, accessToken: accessTokenPlain, pin: registrationPin });
         registeredAt = new Date();
       } catch (err) {
         registrationError = err instanceof Error ? err.message : 'Unknown Meta API error';
