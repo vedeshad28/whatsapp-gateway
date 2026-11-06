@@ -24,7 +24,6 @@ import {
 } from '@/lib/whatsapp/meta-api';
 import { encrypt, decrypt } from '@/lib/whatsapp/encryption';
 import { deriveRegistrationPin } from '@/lib/whatsapp/registration-pin';
-import { ensureDefaultInvoiceTemplate } from '@/lib/whatsapp/default-invoice-template';
 
 export class ConnectAccountError extends Error {
   readonly status: number;
@@ -219,10 +218,6 @@ export async function connectAccount(accountId: string, input: ConnectAccountInp
 
     if (coexistence && subscribedAppsAt && !alreadyLinked) {
       await requestCoexistenceSync(phoneNumberId, accessTokenPlain);
-    }
-
-    if (!registrationError) {
-      await ensureDefaultInvoiceTemplate(accountId, wabaId, accessTokenPlain);
     }
   }
 

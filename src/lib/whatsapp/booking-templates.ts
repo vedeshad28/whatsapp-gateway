@@ -24,7 +24,7 @@ import type { TemplatePayload } from '@/lib/whatsapp/template-validators';
 
 export const BOOKING_TEMPLATE_LANGUAGE = 'en';
 export const BOOKING_OTP_TEMPLATE = 'booking_otp';
-const OTP_EXPIRY_MINUTES = 5;
+export const OTP_EXPIRY_MINUTES = 5;
 
 export interface BookingTemplateOptions {
   /**

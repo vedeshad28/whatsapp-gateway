@@ -21,7 +21,6 @@ const metaMock = vi.hoisted(() => ({
 vi.mock('@/lib/db', () => ({ prisma: prismaMock }));
 vi.mock('@/lib/whatsapp/meta-api', () => metaMock);
 vi.mock('@/lib/whatsapp/encryption', () => ({ encrypt: (s: string) => `enc:${s}`, decrypt: (s: string) => s }));
-vi.mock('@/lib/whatsapp/default-invoice-template', () => ({ ensureDefaultInvoiceTemplate: vi.fn() }));
 
 import { connectAccount } from './connect-account';
 import { deriveRegistrationPin } from './registration-pin';
