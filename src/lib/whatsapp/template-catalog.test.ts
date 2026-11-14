@@ -26,8 +26,10 @@ vi.mock('@/lib/db', () => ({ prisma: prismaMock }));
 vi.mock('@/lib/whatsapp/template-manage', () => manageMock);
 
 import {
+  buildDailySummaryTemplate,
   buildInvoiceTemplate,
   CATALOG_TEMPLATE_NAMES,
+  DAILY_SUMMARY_TEMPLATE,
   getCatalogStatuses,
   INVOICE_TEMPLATE,
   submitCatalogTemplates,
@@ -90,6 +92,55 @@ describe('catalog', () => {
     const otp = (await getCatalogStatuses('acc1')).find((s) => s.name === 'booking_otp');
 
     expect(otp?.error).toMatch(/hasn't allowed Salonify to create templates/);
+  });
+});
+
+describe('platform templates', () => {
+  it('builds the daily summary with nine body variables and a sample for each', () => {
+    const t = buildDailySummaryTemplate();
+    expect(t).toMatchObject({ name: 'daily_summary_v1', category: 'Utility', language: 'en' });
+    expect(t.header_type).toBeUndefined();
+    expect(t.body_text.match(/\{\{\d\}\}/g)).toEqual(
+      ['{{1}}', '{{2}}', '{{3}}', '{{4}}', '{{5}}', '{{6}}', '{{7}}', '{{8}}', '{{9}}'],
+    );
+    expect(t.sample_values?.body).toHaveLength(9);
+    // Meta refuses a body that starts or ends with a variable.
+    expect(t.body_text.startsWith('{{')).toBe(false);
+    expect(t.body_text.trimEnd().endsWith('}}')).toBe(false);
+  });
+
+  it('keeps the daily summary out of the list a salon sees', async () => {
+    expect(CATALOG_TEMPLATE_NAMES).not.toContain(DAILY_SUMMARY_TEMPLATE);
+
+    const names = (await getCatalogStatuses('acc1')).map((s) => s.name);
+
+    expect(names).not.toContain(DAILY_SUMMARY_TEMPLATE);
+  });
+
+  it('lists the daily summary when the caller asks for platform templates', async () => {
+    const statuses = await getCatalogStatuses('acc1', { includePlatform: true });
+
+    expect(statuses.find((s) => s.name === DAILY_SUMMARY_TEMPLATE)).toMatchObject({
+      group: 'platform',
+      status: 'MISSING',
+    });
+  });
+
+  it('refuses to submit the daily summary on a salon account', async () => {
+    await expect(submitCatalogTemplates('acc1', [DAILY_SUMMARY_TEMPLATE])).rejects.toThrow(
+      'Unknown template(s): daily_summary_v1',
+    );
+    expect(manageMock.submitTemplate).not.toHaveBeenCalled();
+  });
+
+  it('submits the daily summary when platform templates are included', async () => {
+    await submitCatalogTemplates('acc1', [DAILY_SUMMARY_TEMPLATE], { includePlatform: true });
+
+    expect(manageMock.submitTemplate).toHaveBeenCalledTimes(1);
+    expect(manageMock.submitTemplate).toHaveBeenCalledWith(
+      'acc1',
+      expect.objectContaining({ name: DAILY_SUMMARY_TEMPLATE }),
+    );
   });
 });
 

@@ -6,8 +6,13 @@
 // own copy. The salon app shows this list on Settings > WhatsApp and lets the owner choose which
 // templates to submit. Booking-only callers keep using booking-templates.ts, which this builds on.
 //
+// One more group, `platform`, holds templates Salonify itself sends to salon owners from its shared
+// number (the nightly daily summary). A salon's own number never needs those, so they are left out of
+// the list unless the caller asks for them with `includePlatform`.
+//
 // The variable ORDER of every template is a contract with the salon backend
-// (BookingMessageFormatter, WhatsAppInvoiceSendService). Change one side, change the other.
+// (BookingMessageFormatter, WhatsAppInvoiceSendService, DailySummaryFormatter). Change one side,
+// change the other.
 // ============================================================
 
 import { prisma } from '@/lib/db';
@@ -30,7 +35,10 @@ import type { TemplatePayload } from '@/lib/whatsapp/template-validators';
 /** The invoice template the salon backend sends (WhatsAppInvoiceSendService.INVOICE_TEMPLATE_NAME). */
 export const INVOICE_TEMPLATE = 'invoice_ready_v3';
 
-export type CatalogGroup = 'booking_customer' | 'booking_salon' | 'invoice' | 'verification';
+/** The nightly summary the salon backend sends to salon owners (DailySummaryFormatter). */
+export const DAILY_SUMMARY_TEMPLATE = 'daily_summary_v1';
+
+export type CatalogGroup = 'booking_customer' | 'booking_salon' | 'invoice' | 'verification' | 'platform';
 
 export interface CatalogTemplateStatus {
   name: string;
@@ -49,6 +57,41 @@ interface CatalogEntry {
 export interface CatalogOptions extends BookingTemplateOptions {
   /** Public https origin of this gateway, where the sample invoice PDF is served. Defaults to GATEWAY_PUBLIC_BASE_URL. */
   publicBaseUrl?: string | null;
+  /** Also list (and allow submitting) the `platform` group. Only for Salonify's own shared number. */
+  includePlatform?: boolean;
+}
+
+/**
+ * The nightly summary sent to a salon owner. The product name, support numbers and website are
+ * variables, not fixed text, so the super admin can change them without a new Meta review.
+ *
+ * 1 product name, 2 date, 3 total paid, 4 bills paid in words ("18 bills" / "1 bill"), 5 cash,
+ * 6 online (UPI + card + online), 7 new customers, 8 support numbers, 9 website
+ *
+ * Meta refuses two variables with only spaces or punctuation between them, which is why the line
+ * reads "₹{{3}} from {{4}}" and not "₹{{3}} ({{4}})".
+ */
+export function buildDailySummaryTemplate(): TemplatePayload {
+  return {
+    name: DAILY_SUMMARY_TEMPLATE,
+    category: 'Utility',
+    language: BOOKING_TEMPLATE_LANGUAGE,
+    body_text:
+      'Dear client, greetings from {{1}}!\n\n📊 Daily Summary – {{2}}\n\n💰 Total bills paid: ₹{{3}} from {{4}}\n • Cash: ₹{{5}}\n • Online: ₹{{6}}\n\n👥 New customers: {{7}}\n\nFor any assistance, please contact us:\nSupport: {{8}}\nWebsite: {{9}}\n\nHave a great day! Keep growing your business.',
+    sample_values: {
+      body: [
+        'Salonify',
+        'Sat, 14 Nov 2026',
+        '12,850',
+        '18 bills',
+        '4,850',
+        '8,000',
+        '5',
+        '+91 98765 43210 / +91 98765 43211',
+        'https://www.example.com',
+      ],
+    },
+  };
 }
 
 /** Same wording as the template approved on Salonify's own account. */
@@ -107,6 +150,13 @@ function buildCatalog(options: CatalogOptions): CatalogEntry[] {
         }),
     },
   ];
+  if (options.includePlatform) {
+    entries.push({
+      name: DAILY_SUMMARY_TEMPLATE,
+      group: 'platform',
+      submit: (accountId) => submitTemplate(accountId, buildDailySummaryTemplate()),
+    });
+  }
   return entries;
 }
 
